@@ -124,6 +124,9 @@ public struct StreamingAudioSourceFactory {
         var totalSamples = 0
         let inputComplete = OSAllocatedUnfairLock(initialState: false)
         let readError = OSAllocatedUnfairLock<Error?>(initialState: nil)
+        // Frames left unread when a read fails, so a genuinely truncated file
+        // can be told apart from a reported length that overshoots the audio.
+        let unreadFrames = OSAllocatedUnfairLock<AVAudioFramePosition>(initialState: 0)
 
         // Buffer is only accessed synchronously by AVAudioConverter's input block callback
         nonisolated(unsafe) let capturedInputBuffer = inputBuffer
@@ -144,6 +147,7 @@ public struct StreamingAudioSourceFactory {
                 }
             } catch {
                 readError.withLock { $0 = error }
+                unreadFrames.withLock { $0 = audioFile.length - audioFile.framePosition }
                 capturedInputBuffer.frameLength = 0
             }
 
@@ -173,8 +177,25 @@ public struct StreamingAudioSourceFactory {
             }
 
             if let error = readError.withLock({ $0 }) {
-                throw StreamingAudioError.processingFailed(
-                    "Failed while reading audio: \(error.localizedDescription)"
+                // An MP3 written without a Xing/LAME header has no exact sample
+                // count, so AVAudioFile reports packets × frames-per-packet.
+                // That overshoots the decodable audio by up to a packet, and the
+                // read of that phantom tail fails. Dropping a few milliseconds of
+                // encoder padding beats failing the file, so only a shortfall too
+                // large to be padding is treated as a real read failure.
+                let shortfall = unreadFrames.withLock { $0 }
+                let toleratedShortfall = AVAudioFramePosition(inputFormat.sampleRate)
+                guard totalSamples > 0, shortfall <= toleratedShortfall else {
+                    throw StreamingAudioError.processingFailed(
+                        "Failed while reading audio: \(error.localizedDescription)"
+                    )
+                }
+
+                // Reading stopped here, so the stream is already ending and this
+                // will not fire again.
+                readError.withLock { $0 = nil }
+                logger.warning(
+                    "Audio ended \(shortfall) frames before its reported length; treating the unreadable tail as end of stream"
                 )
             }
 
