@@ -61,16 +61,10 @@ struct ChunkProcessor {
         startTime: Date,
         progressHandler: ((Double) async -> Void)? = nil
     ) async throws -> ASRResult {
-        var chunkOutputs: [[TokenWindow]] = []
-
+        // Lay out every chunk window up front so they can run concurrently.
+        var windows: [(start: Int, end: Int, isLast: Bool)] = []
         var chunkStart = 0
-        var chunkIndex = 0
-        var chunkDecoderState = TdtDecoderState.make(
-            decoderLayers: await manager.getDecoderLayers()
-        )
-
         while chunkStart < totalSamples {
-            try Task.checkCancellation()
             let candidateEnd = chunkStart + chunkSamples
             let isLastChunk = candidateEnd >= totalSamples
             let chunkEnd = isLastChunk ? totalSamples : candidateEnd
@@ -78,55 +72,91 @@ struct ChunkProcessor {
             if chunkEnd <= chunkStart {
                 break
             }
-
-            chunkDecoderState.reset()
-
-            // For chunks after the first, prepend context samples from the overlap region.
-            // This provides left context for the mel spectrogram STFT window and encoder convolutions.
-            let contextSamples = chunkIndex > 0 ? melContextSamples : 0
-            let contextStart = chunkStart - contextSamples
-            let chunkLengthWithContext = chunkEnd - contextStart
-            let chunkSamplesArray = try readSamples(offset: contextStart, count: chunkLengthWithContext)
-
-            let (windowTokens, windowTimestamps, windowConfidences, windowDurations) = try await transcribeChunk(
-                samples: chunkSamplesArray,
-                contextSamples: contextSamples,
-                chunkStart: chunkStart,
-                isLastChunk: isLastChunk,
-                using: manager,
-                decoderState: &chunkDecoderState
-            )
-
-            // Combine tokens, timestamps, and confidences into aligned tuples
-            guard windowTokens.count == windowTimestamps.count && windowTokens.count == windowConfidences.count else {
-                throw ASRError.processingFailed("Token, timestamp, and confidence arrays are misaligned")
-            }
-
-            // Default to 0 per token if durations array is misaligned (shouldn't happen in practice)
-            let durations =
-                windowDurations.count == windowTokens.count
-                ? windowDurations : Array(repeating: 0, count: windowTokens.count)
-
-            let windowData: [TokenWindow] = zip(
-                zip(zip(windowTokens, windowTimestamps), windowConfidences), durations
-            ).map {
-                (token: $0.0.0.0, timestamp: $0.0.0.1, confidence: $0.0.1, duration: $0.1)
-            }
-            chunkOutputs.append(windowData)
-
-            chunkIndex += 1
-
+            windows.append((start: chunkStart, end: chunkEnd, isLast: isLastChunk))
             if isLastChunk {
                 break
             }
-
-            if let progressHandler {
-                let progress = min(1.0, max(0.0, Double(chunkEnd) / Double(totalSamples)))
-                await progressHandler(progress)
-            }
-
             chunkStart += strideSamples
         }
+
+        let decoderLayers = await manager.getDecoderLayers()
+        let concurrency = max(1, min(manager.config.chunkConcurrency, windows.count))
+        var outputsByIndex = [[TokenWindow]?](repeating: nil, count: windows.count)
+        let total = totalSamples
+
+        // Each chunk starts from a fresh decoder state, so chunks are independent
+        // and their order of completion does not matter. Results are stored by
+        // index and merged in order below, exactly as in the sequential case.
+        try await withThrowingTaskGroup(of: (Int, [TokenWindow]).self) { group in
+            var nextIndex = 0
+            var completedSamples = 0
+
+            func addNext() {
+                guard nextIndex < windows.count else { return }
+                let chunkIndex = nextIndex
+                let window = windows[chunkIndex]
+                nextIndex += 1
+                group.addTask {
+                    try Task.checkCancellation()
+                    var chunkDecoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
+
+                    // For chunks after the first, prepend context samples from the overlap region.
+                    // This provides left context for the mel spectrogram STFT window and encoder convolutions.
+                    let contextSamples = chunkIndex > 0 ? melContextSamples : 0
+                    let contextStart = window.start - contextSamples
+                    let chunkLengthWithContext = window.end - contextStart
+                    let chunkSamplesArray = try readSamples(offset: contextStart, count: chunkLengthWithContext)
+
+                    let (windowTokens, windowTimestamps, windowConfidences, windowDurations) =
+                        try await transcribeChunk(
+                            samples: chunkSamplesArray,
+                            contextSamples: contextSamples,
+                            chunkStart: window.start,
+                            isLastChunk: window.isLast,
+                            using: manager,
+                            decoderState: &chunkDecoderState
+                        )
+
+                    // Combine tokens, timestamps, and confidences into aligned tuples
+                    guard
+                        windowTokens.count == windowTimestamps.count
+                            && windowTokens.count == windowConfidences.count
+                    else {
+                        throw ASRError.processingFailed("Token, timestamp, and confidence arrays are misaligned")
+                    }
+
+                    // Default to 0 per token if durations array is misaligned (shouldn't happen in practice)
+                    let durations =
+                        windowDurations.count == windowTokens.count
+                        ? windowDurations : Array(repeating: 0, count: windowTokens.count)
+
+                    let windowData: [TokenWindow] = zip(
+                        zip(zip(windowTokens, windowTimestamps), windowConfidences), durations
+                    ).map {
+                        (token: $0.0.0.0, timestamp: $0.0.0.1, confidence: $0.0.1, duration: $0.1)
+                    }
+                    return (chunkIndex, windowData)
+                }
+            }
+
+            for _ in 0..<concurrency {
+                addNext()
+            }
+
+            for try await (chunkIndex, windowData) in group {
+                outputsByIndex[chunkIndex] = windowData
+                addNext()
+
+                let window = windows[chunkIndex]
+                completedSamples += min(strideSamples, window.end - window.start)
+                if let progressHandler, !window.isLast {
+                    let progress = min(1.0, max(0.0, Double(completedSamples) / Double(total)))
+                    await progressHandler(progress)
+                }
+            }
+        }
+
+        let chunkOutputs = outputsByIndex.compactMap { $0 }
 
         guard var mergedTokens = chunkOutputs.first else {
             return await manager.processTranscriptionResult(

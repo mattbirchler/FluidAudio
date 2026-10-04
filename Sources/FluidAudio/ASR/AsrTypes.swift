@@ -19,6 +19,11 @@ public struct ASRConfig: Sendable {
     /// Default: 480,000 samples (~30 seconds at 16kHz)
     public let streamingThreshold: Int
 
+    /// How many chunks of a long file to transcribe at the same time.
+    /// Chunks are decoded statelessly, so running several concurrently produces
+    /// the same tokens as running them one after another. Default: 1 (sequential).
+    public let chunkConcurrency: Int
+
     public static let `default` = ASRConfig()
 
     public init(
@@ -26,8 +31,10 @@ public struct ASRConfig: Sendable {
         tdtConfig: TdtConfig = .default,
         encoderHiddenSize: Int = ASRConstants.encoderHiddenSize,
         streamingEnabled: Bool = true,
-        streamingThreshold: Int = 480_000
+        streamingThreshold: Int = 480_000,
+        chunkConcurrency: Int = 1
     ) {
+        self.chunkConcurrency = max(1, chunkConcurrency)
         self.sampleRate = sampleRate
         self.tdtConfig = tdtConfig
         self.encoderHiddenSize = encoderHiddenSize
