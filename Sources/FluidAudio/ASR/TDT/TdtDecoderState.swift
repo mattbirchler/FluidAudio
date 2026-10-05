@@ -97,6 +97,17 @@ struct TdtDecoderState: Sendable {
 
 extension MLMultiArray {
     func resetData(to value: NSNumber) {
+        // Zeroing is the only case used in practice, and one memset is far
+        // cheaper than boxing an NSNumber for every element. Clearing every
+        // byte is correct for any element type and any stride layout.
+        if value.doubleValue == 0 {
+            withUnsafeMutableBytes { bytes, _ in
+                if let base = bytes.baseAddress {
+                    memset(base, 0, bytes.count)
+                }
+            }
+            return
+        }
         for i in 0..<count {
             self[i] = value
         }
