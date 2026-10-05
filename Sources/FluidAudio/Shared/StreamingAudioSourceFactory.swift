@@ -45,11 +45,13 @@ public struct StreamingAudioSourceFactory {
 
             let totalSamples: Int
             do {
-                totalSamples = try streamConvert(
+                totalSamples = try Self.streamConvert(
                     audioFile: audioFile,
-                    converter: converter,
-                    handle: handle
-                )
+                    converter: converter
+                ) { samples, count in
+                    let data = Data(bytes: UnsafeRawPointer(samples), count: count * MemoryLayout<Float>.stride)
+                    try handle.write(contentsOf: data)
+                }
             } catch {
                 logger.error("Streaming conversion failed before file mapping: \(error.localizedDescription)")
                 throw error
@@ -91,10 +93,14 @@ public struct StreamingAudioSourceFactory {
         return tempDirectory.appendingPathComponent("fluidaudio-streaming-\(identifier).raw")
     }
 
-    private func streamConvert(
+    /// Decodes the whole file to the converter's output format, handing each
+    /// converted block to `sink` in order. Shared by the disk-backed and
+    /// progressive sources so both produce exactly the same samples.
+    /// - Returns: the total number of samples produced.
+    static func streamConvert(
         audioFile: AVAudioFile,
         converter: AVAudioConverter,
-        handle: FileHandle
+        sink: (UnsafePointer<Float>, Int) throws -> Void
     ) throws -> Int {
         let inputFormat = audioFile.processingFormat
         let targetFormat = converter.outputFormat
@@ -183,10 +189,7 @@ public struct StreamingAudioSourceFactory {
                 guard let channelData = outputBuffer.floatChannelData?.pointee else {
                     throw StreamingAudioError.processingFailed("Missing channel data during conversion")
                 }
-                let byteCount = producedFrames * MemoryLayout<Float>.stride
-                let baseAddress = UnsafeRawPointer(channelData)
-                let data = Data(bytes: baseAddress, count: byteCount)
-                try handle.write(contentsOf: data)
+                try sink(UnsafePointer(channelData), producedFrames)
                 totalSamples += producedFrames
             }
 
@@ -211,7 +214,7 @@ public enum StreamingAudioError: Error, LocalizedError {
 }
 
 extension StreamingAudioError {
-    fileprivate static func failedToAllocateBuffer(_ name: String, requestedFrames: Int) -> StreamingAudioError {
+    static func failedToAllocateBuffer(_ name: String, requestedFrames: Int) -> StreamingAudioError {
         .processingFailed("Failed to allocate \(name.lowercased()) buffer (\(requestedFrames) frames)")
     }
 }

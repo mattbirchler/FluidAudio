@@ -48,7 +48,13 @@ struct ChunkProcessor {
     /// Initialize with a streaming audio sample source for memory-efficient processing.
     init(sampleSource: StreamingAudioSampleSource) {
         self.sampleSource = sampleSource
-        self.totalSamples = sampleSource.sampleCount
+        if let progressive = sampleSource as? ProgressiveAudioSampleSource {
+            // The true count is not known until decoding ends, and asking for
+            // it would wait for that. The estimate is only used for progress.
+            self.totalSamples = progressive.estimatedSampleCount
+        } else {
+            self.totalSamples = sampleSource.sampleCount
+        }
     }
 
     /// Convenience initializer for in-memory audio samples.
@@ -61,28 +67,48 @@ struct ChunkProcessor {
         startTime: Date,
         progressHandler: ((Double) async -> Void)? = nil
     ) async throws -> ASRResult {
-        // Lay out every chunk window up front so they can run concurrently.
+        // Chunk windows are laid out one at a time, just before each is
+        // started. A window is the last one when it reaches the end of the
+        // audio, and a source that is still decoding only learns where that is
+        // as it goes. Waiting to decide gives the same windows as laying them
+        // all out up front from a known total.
+        let progressive = sampleSource as? ProgressiveAudioSampleSource
         var windows: [(start: Int, end: Int, isLast: Bool)] = []
         var chunkStart = 0
-        while chunkStart < totalSamples {
+        var layoutDone = false
+        var progressTotal = totalSamples
+
+        func layOutNextWindow() async throws -> Bool {
+            guard !layoutDone else { return false }
             let candidateEnd = chunkStart + chunkSamples
-            let isLastChunk = candidateEnd >= totalSamples
-            let chunkEnd = isLastChunk ? totalSamples : candidateEnd
+            let knownTotal: Int?
+            if let progressive {
+                // nil means the audio runs past this window, so it is not the last.
+                knownTotal = try await progressive.finalCountUnlessBeyond(candidateEnd)
+            } else {
+                knownTotal = totalSamples
+            }
+            if let knownTotal {
+                progressTotal = knownTotal
+            }
+            let isLastChunk = knownTotal.map { candidateEnd >= $0 } ?? false
+            let chunkEnd = isLastChunk ? (knownTotal ?? candidateEnd) : candidateEnd
 
             if chunkEnd <= chunkStart {
-                break
+                layoutDone = true
+                return false
             }
             windows.append((start: chunkStart, end: chunkEnd, isLast: isLastChunk))
             if isLastChunk {
-                break
+                layoutDone = true
             }
             chunkStart += strideSamples
+            return true
         }
 
         let decoderLayers = await manager.getDecoderLayers()
-        let concurrency = max(1, min(manager.config.chunkConcurrency, windows.count))
-        var outputsByIndex = [[TokenWindow]?](repeating: nil, count: windows.count)
-        let total = totalSamples
+        let concurrency = max(1, manager.config.chunkConcurrency)
+        var outputsByIndex: [Int: [TokenWindow]] = [:]
 
         // Each chunk starts from a fresh decoder state, so chunks are independent
         // and their order of completion does not matter. Results are stored by
@@ -91,8 +117,8 @@ struct ChunkProcessor {
             var nextIndex = 0
             var completedSamples = 0
 
-            func addNext() {
-                guard nextIndex < windows.count else { return }
+            func addNext() async throws {
+                guard try await layOutNextWindow() else { return }
                 let chunkIndex = nextIndex
                 let window = windows[chunkIndex]
                 nextIndex += 1
@@ -140,23 +166,23 @@ struct ChunkProcessor {
             }
 
             for _ in 0..<concurrency {
-                addNext()
+                try await addNext()
             }
 
             for try await (chunkIndex, windowData) in group {
                 outputsByIndex[chunkIndex] = windowData
-                addNext()
+                try await addNext()
 
                 let window = windows[chunkIndex]
                 completedSamples += min(strideSamples, window.end - window.start)
                 if let progressHandler, !window.isLast {
-                    let progress = min(1.0, max(0.0, Double(completedSamples) / Double(total)))
+                    let progress = min(1.0, max(0.0, Double(completedSamples) / Double(max(progressTotal, 1))))
                     await progressHandler(progress)
                 }
             }
         }
 
-        let chunkOutputs = outputsByIndex.compactMap { $0 }
+        let chunkOutputs = outputsByIndex.keys.sorted().compactMap { outputsByIndex[$0] }
 
         guard var mergedTokens = chunkOutputs.first else {
             return await manager.processTranscriptionResult(

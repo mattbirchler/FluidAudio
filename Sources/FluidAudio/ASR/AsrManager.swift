@@ -452,6 +452,10 @@ public actor AsrManager {
     public func transcribeStreaming(_ url: URL, source: AudioSource = .system) async throws -> ASRResult {
         guard isAvailable else { throw ASRError.notInitialized }
 
+        if config.backgroundDecoding, let result = try await transcribeDecodingInBackground(url) {
+            return result
+        }
+
         let startTime = Date()
 
         // Create a disk-backed source for memory-efficient access
@@ -496,6 +500,67 @@ public actor AsrManager {
             if shouldEmitProgress {
                 await progressEmitter.failSession(error)
             }
+            throw error
+        }
+    }
+
+    /// Files shorter than this are decoded up front. They decode in a fraction
+    /// of a second, and the decode-first path knows their exact length before
+    /// it starts, which keeps the short-audio checks simple.
+    private static let backgroundDecodingMinimumSamples = 16_000 * 60
+
+    /// Transcribes a long file while it is still being decoded.
+    ///
+    /// - Returns: nil when this path does not apply (the file is short, could
+    ///   not be set up, or turned out to hold more audio than its header said).
+    ///   The caller then decodes the whole file first, as before.
+    private func transcribeDecodingInBackground(_ url: URL) async throws -> ASRResult? {
+        let startTime = Date()
+
+        let sampleSource: ProgressiveAudioSampleSource
+        do {
+            sampleSource = try ProgressiveAudioSampleSource(url: url, targetSampleRate: config.sampleRate)
+        } catch {
+            // The decode-first path reports the same problem with its own error.
+            logger.debug("Background decoding unavailable: \(error.localizedDescription)")
+            return nil
+        }
+        guard sampleSource.estimatedSampleCount >= Self.backgroundDecodingMinimumSamples else {
+            sampleSource.cleanup()
+            return nil
+        }
+
+        _ = await progressEmitter.ensureSession()
+
+        do {
+            let processor = ChunkProcessor(sampleSource: sampleSource)
+            let result = try await processor.process(
+                using: self,
+                startTime: startTime,
+                progressHandler: { [weak self] progress in
+                    guard let self else { return }
+                    await self.progressEmitter.report(progress: progress)
+                }
+            )
+
+            // The header promised at least a minute. If decoding produced
+            // almost nothing, the file is damaged rather than short.
+            let totalSamples = try await sampleSource.finalSampleCount()
+            guard totalSamples >= 16_000 else { throw ASRError.invalidAudioData }
+
+            sampleSource.cleanup()
+            try await self.resetDecoderState()
+            await progressEmitter.finishSession()
+            return result
+        } catch ProgressiveAudioError.capacityExceeded {
+            // More audio than the header said. Start again the slow way, which
+            // needs no estimate. The progress session stays open for it.
+            sampleSource.cleanup()
+            logger.info("Audio ran past its header length; decoding the whole file before transcribing")
+            return nil
+        } catch {
+            sampleSource.cleanup()
+            await progressEmitter.failSession(error)
             throw error
         }
     }

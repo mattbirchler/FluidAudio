@@ -24,6 +24,11 @@ public struct ASRConfig: Sendable {
     /// the same tokens as running them one after another. Default: 1 (sequential).
     public let chunkConcurrency: Int
 
+    /// Decode long files on a background thread while their first chunks are
+    /// already being transcribed, instead of decoding the whole file first.
+    /// The samples and the transcript are the same either way. Default: true.
+    public let backgroundDecoding: Bool
+
     public static let `default` = ASRConfig()
 
     public init(
@@ -32,9 +37,11 @@ public struct ASRConfig: Sendable {
         encoderHiddenSize: Int = ASRConstants.encoderHiddenSize,
         streamingEnabled: Bool = true,
         streamingThreshold: Int = 480_000,
-        chunkConcurrency: Int = 1
+        chunkConcurrency: Int = 1,
+        backgroundDecoding: Bool = true
     ) {
         self.chunkConcurrency = max(1, chunkConcurrency)
+        self.backgroundDecoding = backgroundDecoding
         self.sampleRate = sampleRate
         self.tdtConfig = tdtConfig
         self.encoderHiddenSize = encoderHiddenSize
