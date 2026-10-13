@@ -54,6 +54,8 @@ public struct StreamingAudioSourceFactory {
                 }
             } catch {
                 logger.error("Streaming conversion failed before file mapping: \(error.localizedDescription)")
+                try? handle.close()
+                try? FileManager.default.removeItem(at: tempURL)
                 throw error
             }
 
@@ -140,16 +142,24 @@ public struct StreamingAudioSourceFactory {
                 return nil
             }
 
+            var isFinalBlock = false
             do {
                 let remainingFrames = AVAudioFrameCount(audioFile.length - audioFile.framePosition)
                 let framesToRead = min(inputCapacity, remainingFrames)
+                isFinalBlock = remainingFrames <= inputCapacity
                 if framesToRead > 0 {
                     try audioFile.read(into: capturedInputBuffer, frameCount: framesToRead)
                 } else {
                     capturedInputBuffer.frameLength = 0
                 }
             } catch {
-                readError.withLock { $0 = error }
+                // Some MP3s report a length a frame or so longer than what
+                // decodes, so the last read runs off the end. That is the end of
+                // the audio, not a failure. The error it surfaces as varies, so
+                // any failure on the final block counts.
+                if !isFinalBlock && !Self.isEndOfFile(error) {
+                    readError.withLock { $0 = error }
+                }
                 capturedInputBuffer.frameLength = 0
             }
 
@@ -199,6 +209,12 @@ public struct StreamingAudioSourceFactory {
         }
 
         return totalSamples
+    }
+
+    /// Whether a read failed only because the file ended before its reported length.
+    static func isEndOfFile(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        return nsError.domain == NSOSStatusErrorDomain && nsError.code == Int(kAudioFileEndOfFileError)
     }
 }
 
